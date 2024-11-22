@@ -5,28 +5,268 @@ import {
     ISuperfluid,
     ISuperToken,
     IConstantFlowAgreementV1,
-    IInstantDistributionAgreementV1
-} from "../interfaces/superfluid/ISuperfluid.sol";
-
-import {
     IGeneralDistributionAgreementV1,
     ISuperfluidPool,
     PoolConfig
-} from "../interfaces/agreements/gdav1/IGeneralDistributionAgreementV1.sol";
+} from "../interfaces/superfluid/ISuperfluid.sol";
+
 
 /**
  * @title Library for Token Centric Interface
  * @author Superfluid
  * @dev Set `using for ISuperToken` in including file, and call any of these functions on an instance
  * of ISuperToken.
- * Note that it is important to "warm up" the cache and cache the host, cfa, ida before calling,
- * this is only applicable to Foundry tests where the vm.expectRevert() will not work as expected.
- * You must use vm.startPrank(account) instead of vm.prank when executing functions if the cache
- * isn't "warmed up" yet. vm.prank impersonates the account only for the first call, which will be
- * used for caching.
+ * The architecture of the Superfluid framework and its initial API were heavily influenced by the
+ * gas economics on Ethereum at the time, leading to compromises in terms of API ergonomics.
+ * This library mitigates that by providing a more convenient Solidity API for SuperTokens.
+ * While most methods are just wrappers around equivalent methods in a Superfluid agreement,
+ * some implement higher level abstractions.
+ * Note using the library in foundry tests can lead to counter-intuitive behaviour.
+ * E.g. "prank" won't set the expected msg.sender for calls done using the library.
+ * Also, reverts caused by the library itself won't be recognized by foundry, because
+ * it expects them to happen in the context of an external call.
+ * This is not specific to this library, but a general limitation of foundry when using libraries in tests.
  */
 library SuperTokenV1Library {
-    /** CFA BASE CRUD ************************************* */
+
+    /** AGREEMENT-ABSTRACTED FUNCTIONS ************************************* */
+
+    /**
+     * @dev creates a flow to an account or to pool members.
+     * If the receiver is an account, it uses the CFA, if it's a pool it uses the GDA.
+     * @param token Super token address
+     * @param receiverOrPool The receiver (account) or pool
+     * @param flowRate the flowRate to be set.
+     * @return A boolean value indicating whether the operation was successful.
+     * Note that all the specifics of the underlying agreement used still apply.
+     * E.g. if the GDA is used, the effective flowRate may differ from the selected one.
+     */
+    function flowX(
+        ISuperToken token,
+        address receiverOrPool,
+        int96 flowRate
+    ) internal returns(bool) {
+        address sender = address(this);
+
+        (, IGeneralDistributionAgreementV1 gda) = _getAndCacheHostAndGDA(token);
+        if (gda.isPool(token, receiverOrPool)) {
+            return distributeFlow(
+                token,
+                sender,
+                ISuperfluidPool(receiverOrPool),
+                flowRate
+            );
+        } else {
+            return flow(token, receiverOrPool, flowRate);
+        }
+    }
+
+    /**
+     * @dev transfers `amount` to an account or distributes it to pool members.
+     * @param token Super token address
+     * @param receiverOrPool The receiver (account) or pool
+     * @param amount the amount to be transferred/distributed
+     * @return A boolean value indicating whether the operation was successful.
+     * Note in case of distribution, the effective amount may be smaller than requested.
+     */
+    function transferX(
+        ISuperToken token,
+        address receiverOrPool,
+        uint256 amount
+    ) internal returns(bool) {
+        address sender = address(this);
+
+        (, IGeneralDistributionAgreementV1 gda) = _getAndCacheHostAndGDA(token);
+        if (gda.isPool(token, receiverOrPool)) {
+            return distribute(
+                token,
+                sender,
+                ISuperfluidPool(receiverOrPool),
+                amount
+            );
+        } else {
+            return token.transfer(receiverOrPool, amount);
+        }
+    }
+
+    /** AGREEMENT-ABSTRACTED VIEW FUNCTIONS ************************************* */
+
+    /**
+     * @dev get flow rate between two accounts for given token
+     * @param token The token used in flow
+     * @param sender The sender of the flow
+     * @param receiverOrPool The receiver or pool receiving or distributing the flow
+     * @return flowRate The flow rate
+     * Note: edge case: if a CFA stream is going to a pool, it will return 0.
+     */
+    function getFlowRate(ISuperToken token, address sender, address receiverOrPool)
+        internal view returns(int96 flowRate)
+    {
+        if (_isPool(token, receiverOrPool)) {
+            (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+            (, flowRate,) = gda.getFlow(token, sender, ISuperfluidPool(receiverOrPool));
+        } else {
+            (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
+            (, flowRate, , ) = cfa.getFlow(token, sender, receiverOrPool);
+        }
+    }
+
+    /**
+     * @dev get flow info between an account and another account or pool for given token
+     * @param token The token used in flow
+     * @param sender The sender of the flow
+     * @param receiverOrPool The receiver or pool receiving or distributing the flow
+     * @return lastUpdated Timestamp of flow creation or last flowrate change
+     * @return flowRate The flow rate
+     * @return deposit The amount of deposit the flow
+     * @return owedDeposit The amount of owed deposit of the flow
+     * Note: edge case: a CFA stream going to a pool will not be "seen".
+     */
+    function getFlowInfo(ISuperToken token, address sender, address receiverOrPool)
+        internal view
+        returns(uint256 lastUpdated, int96 flowRate, uint256 deposit, uint256 owedDeposit)
+    {
+        if (_isPool(token, receiverOrPool)) {
+            (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+            (lastUpdated, flowRate, deposit) = gda.getFlow(token, sender, ISuperfluidPool(receiverOrPool));
+        } else {
+            (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
+            (lastUpdated, flowRate, deposit, owedDeposit) = cfa.getFlow(token, sender, receiverOrPool);
+        }
+    }
+
+    /**
+     * @dev get net flow rate for given account for given token (CFA + GDA)
+     * @param token Super token address
+     * @param account Account to query
+     * @return flowRate The net flow rate of the account
+     */
+    function getNetFlowRate(ISuperToken token, address account)
+        internal view returns (int96 flowRate)
+    {
+        (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        int96 cfaNetFlow = cfa.getNetFlow(token, account);
+        int96 gdaNetFlow = gda.getNetFlow(token, account);
+        return cfaNetFlow + gdaNetFlow;
+    }
+
+    /**
+     * @dev get the aggregated flow info of the account (CFA + GDA)
+     * @param token Super token address
+     * @param account Account to query
+     * @return lastUpdated Timestamp of the last change of the net flow
+     * @return flowRate The net flow rate of token for account
+     * @return deposit The sum of all deposits for account's flows
+     * @return owedDeposit The sum of all owed deposits for account's flows
+     */
+    function getNetFlowInfo(ISuperToken token, address account)
+        internal
+        view
+        returns (uint256 lastUpdated, int96 flowRate, uint256 deposit, uint256 owedDeposit)
+    {
+        (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+
+        {
+            (uint256 lastUpdatedCFA, int96 cfaNetFlowRate, uint256 cfaDeposit, uint256 cfaOwedDeposit) =
+                cfa.getAccountFlowInfo(token, account);
+
+            lastUpdated = lastUpdatedCFA;
+            flowRate += cfaNetFlowRate;
+            deposit += cfaDeposit;
+            owedDeposit += cfaOwedDeposit;
+        }
+
+        {
+            (uint256 lastUpdatedGDA, int96 gdaNetFlowRate, uint256 gdaDeposit) = gda.getAccountFlowInfo(token, account);
+
+            if (lastUpdatedGDA > lastUpdated) {
+                lastUpdated = lastUpdatedGDA;
+            }
+            flowRate += gdaNetFlowRate;
+            deposit += gdaDeposit;
+        }
+    }
+
+    /**
+     * @dev calculate buffer needed for a CFA flow with the given flowrate (for GDA, see 2nd notice below)
+     * @notice the returned amount is exact only for the scenario where no flow exists before.
+     * In order to get the buffer delta for a delta flowrate, you need to get the buffer amount
+     * for the new total flowrate and subtract the previous buffer.
+     * That's because there's not always linear proportionality between flowrate and buffer.
+     * @notice for GDA flows, the required buffer is typically slightly lower.
+     * That's due to an implementation detail (round-up "clipping" to 64 bit in the CFA).
+     * The return value of this method is thus to be considered not a precise value, but a
+     * lower bound for GDA flows.
+     * @param token The token used in flow
+     * @param flowRate The flowrate to calculate the needed buffer for
+     * @return bufferAmount The buffer amount based on flowRate, liquidationPeriod and minimum deposit
+     */
+    function getBufferAmountByFlowRate(ISuperToken token, int96 flowRate) internal view
+        returns (uint256 bufferAmount)
+    {
+        (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
+        return cfa.getDepositRequiredForFlowRate(token, flowRate);
+    }
+
+    /** CFA BASE FUNCTIONS ************************************* */
+
+    /**
+     * @dev Sets the given CFA flowrate between the caller and a given receiver.
+     * If there's no pre-existing flow and `flowRate` non-zero, a new flow is created.
+     * If there's an existing flow and `flowRate` non-zero, the flowRate of that flow is updated.
+     * If there's an existing flow and `flowRate` zero, the flow is deleted.
+     * If the existing and given flowRate are equal, no action is taken.
+     * On creation of a flow, a "buffer" amount is automatically detracted from the sender account's available balance.
+     * If the sender account is solvent when the flow is deleted, this buffer is redeemed to it.
+     * @param token Super token address
+     * @param receiver The receiver of the flow
+     * @param flowRate The wanted flowrate in wad/second. Only positive values are valid here.
+     * @return bool
+     */
+    function flow(
+        ISuperToken token,
+        address receiver,
+        int96 flowRate
+    ) internal returns (bool) {
+        return flow(token, receiver, flowRate, new bytes(0));
+    }
+
+    /**
+     * @dev Set CFA flowrate with userData
+     * @param token Super token address
+     * @param receiver The receiver of the flow
+     * @param flowRate The wanted flowrate in wad/second. Only positive values are valid here.
+     * @param userData The userdata passed along with call
+     * @return bool
+     */
+    function flow(
+        ISuperToken token,
+        address receiver,
+        int96 flowRate,
+        bytes memory userData
+    ) internal returns (bool) {
+        // note: from the lib's perspective, the caller is "this", NOT "msg.sender"
+        address sender = address(this);
+        int96 prevFlowRate = getCFAFlowRate(token, sender, receiver);
+
+        if (flowRate > 0) {
+            if (prevFlowRate == 0) {
+                return createFlow(token, receiver, flowRate, userData);
+            } else if (prevFlowRate != flowRate) {
+                return updateFlow(token, receiver, flowRate, userData);
+            } // else no change, do nothing
+            return true;
+        } else if (flowRate == 0) {
+            if (prevFlowRate > 0) {
+                return deleteFlow(token, sender, receiver, userData);
+            } // else no change, do nothing
+            return true;
+        } else {
+            revert IConstantFlowAgreementV1.CFA_INVALID_FLOW_RATE();
+        }
+    }
 
     /**
      * @dev Create flow without userData
@@ -62,7 +302,6 @@ library SuperTokenV1Library {
         return true;
     }
 
-
     /**
      * @dev Update flow without userData
      * @param token The token used in flow
@@ -74,7 +313,6 @@ library SuperTokenV1Library {
     {
         return updateFlow(token, receiver, flowRate, new bytes(0));
     }
-
 
     /**
      * @dev Update flow with userData
@@ -133,6 +371,59 @@ library SuperTokenV1Library {
     }
 
     /** CFA ACL ************************************* */
+
+    /**
+     * @notice Like `flow`, but can be invoked by an account with flowOperator permissions
+     * on behalf of the sender account.
+     * @param token Super token address
+     * @param sender The sender of the flow
+     * @param receiver The receiver of the flow
+     * @param flowRate The wanted flowRate in wad/second. Only positive values are valid here.
+     * @return bool
+     */
+    function flowFrom(
+        ISuperToken token,
+        address sender,
+        address receiver,
+        int96 flowRate
+    ) internal returns (bool) {
+        return flowFrom(token, sender, receiver, flowRate, new bytes(0));
+    }
+
+    /**
+     * @notice Like `flowFrom`, but takes userData
+     * @param token Super token address
+     * @param sender The sender of the flow
+     * @param receiver The receiver of the flow
+     * @param flowRate The wanted flowRate in wad/second. Only positive values are valid here.
+     * @param userData The userdata passed along with call
+     * @return bool
+     */
+    function flowFrom(
+        ISuperToken token,
+        address sender,
+        address receiver,
+        int96 flowRate,
+        bytes memory userData
+    ) internal returns (bool) {
+        int96 prevFlowRate = getCFAFlowRate(token, sender, receiver);
+
+        if (flowRate > 0) {
+            if (prevFlowRate == 0) {
+                return createFlowFrom(token, sender, receiver, flowRate, userData);
+            } else if (prevFlowRate != flowRate) {
+                return updateFlowFrom(token, sender, receiver, flowRate, userData);
+            } // else no change, do nothing
+            return true;
+        } else if (flowRate == 0) {
+            if (prevFlowRate > 0) {
+                return deleteFlowFrom(token, sender, receiver, userData);
+            } // else no change, do nothing
+            return true;
+        } else {
+            revert IConstantFlowAgreementV1.CFA_INVALID_FLOW_RATE();
+        }
+    }
 
     /**
      * @dev Update permissions for flow operator
@@ -384,101 +675,6 @@ library SuperTokenV1Library {
     }
 
     /**
-     * @dev Update permissions for flow operator in callback
-     * @notice allowing userData to be a parameter here triggered stack too deep error
-     * @param token The token used in flow
-     * @param flowOperator The address given flow permissions
-     * @param allowCreate creation permissions
-     * @param allowCreate update permissions
-     * @param allowCreate deletion permissions
-     * @param flowRateAllowance The allowance provided to flowOperator
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function setFlowPermissionsWithCtx(
-        ISuperToken token,
-        address flowOperator,
-        bool allowCreate,
-        bool allowUpdate,
-        bool allowDelete,
-        int96 flowRateAllowance,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IConstantFlowAgreementV1 cfa) = _getAndCacheHostAndCFA(token);
-        uint8 permissionsBitmask = (allowCreate ? 1 : 0)
-            | (allowUpdate ? 1 : 0) << 1
-            | (allowDelete ? 1 : 0) << 2;
-        (newCtx, ) = host.callAgreementWithContext(
-            cfa,
-            abi.encodeCall(
-                cfa.updateFlowOperatorPermissions,
-                (
-                    token,
-                    flowOperator,
-                    permissionsBitmask,
-                    flowRateAllowance,
-                    new bytes(0)
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Update permissions for flow operator - give operator max permissions
-     * @param token The token used in flow
-     * @param flowOperator The address given flow permissions
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function setMaxFlowPermissionsWithCtx(
-        ISuperToken token,
-        address flowOperator,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IConstantFlowAgreementV1 cfa) = _getAndCacheHostAndCFA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            cfa,
-            abi.encodeCall(
-                cfa.authorizeFlowOperatorWithFullControl,
-                (
-                    token,
-                    flowOperator,
-                    new bytes(0)
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-    * @dev Update permissions for flow operator - revoke all permission
-     * @param token The token used in flow
-     * @param flowOperator The address given flow permissions
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function revokeFlowPermissionsWithCtx(
-        ISuperToken token,
-        address flowOperator,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IConstantFlowAgreementV1 cfa) = _getAndCacheHostAndCFA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            cfa,
-            abi.encodeCall(
-                cfa.revokeFlowOperatorWithFullControl,
-                (token, flowOperator, new bytes(0))
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-
-    /**
      * @dev Creates flow as an operator without userData
      * @param token The token to flow
      * @param sender The sender of the flow
@@ -520,7 +716,6 @@ library SuperTokenV1Library {
         );
         return true;
     }
-
 
     /**
      * @dev Updates flow as an operator without userData
@@ -603,7 +798,6 @@ library SuperTokenV1Library {
         );
         return true;
     }
-
 
     /** CFA With CTX FUNCTIONS ************************************* */
 
@@ -799,16 +993,110 @@ library SuperTokenV1Library {
         );
     }
 
+    /**
+     * @dev Update permissions for flow operator in callback
+     * @notice allowing userData to be a parameter here triggered stack too deep error
+     * @param token The token used in flow
+     * @param flowOperator The address given flow permissions
+     * @param allowCreate creation permissions
+     * @param allowCreate update permissions
+     * @param allowCreate deletion permissions
+     * @param flowRateAllowance The allowance provided to flowOperator
+     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
+     * @return newCtx The updated context after the execution of the agreement function
+     */
+    function setFlowPermissionsWithCtx(
+        ISuperToken token,
+        address flowOperator,
+        bool allowCreate,
+        bool allowUpdate,
+        bool allowDelete,
+        int96 flowRateAllowance,
+        bytes memory ctx
+    ) internal returns (bytes memory newCtx) {
+        (ISuperfluid host, IConstantFlowAgreementV1 cfa) = _getAndCacheHostAndCFA(token);
+        uint8 permissionsBitmask = (allowCreate ? 1 : 0)
+            | (allowUpdate ? 1 : 0) << 1
+            | (allowDelete ? 1 : 0) << 2;
+        (newCtx, ) = host.callAgreementWithContext(
+            cfa,
+            abi.encodeCall(
+                cfa.updateFlowOperatorPermissions,
+                (
+                    token,
+                    flowOperator,
+                    permissionsBitmask,
+                    flowRateAllowance,
+                    new bytes(0)
+                )
+            ),
+            "0x",
+            ctx
+        );
+    }
+
+    /**
+     * @dev Update permissions for flow operator - give operator max permissions
+     * @param token The token used in flow
+     * @param flowOperator The address given flow permissions
+     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
+     * @return newCtx The updated context after the execution of the agreement function
+     */
+    function setMaxFlowPermissionsWithCtx(
+        ISuperToken token,
+        address flowOperator,
+        bytes memory ctx
+    ) internal returns (bytes memory newCtx) {
+        (ISuperfluid host, IConstantFlowAgreementV1 cfa) = _getAndCacheHostAndCFA(token);
+        (newCtx, ) = host.callAgreementWithContext(
+            cfa,
+            abi.encodeCall(
+                cfa.authorizeFlowOperatorWithFullControl,
+                (
+                    token,
+                    flowOperator,
+                    new bytes(0)
+                )
+            ),
+            "0x",
+            ctx
+        );
+    }
+
+    /**
+    * @dev Update permissions for flow operator - revoke all permission
+     * @param token The token used in flow
+     * @param flowOperator The address given flow permissions
+     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
+     * @return newCtx The updated context after the execution of the agreement function
+     */
+    function revokeFlowPermissionsWithCtx(
+        ISuperToken token,
+        address flowOperator,
+        bytes memory ctx
+    ) internal returns (bytes memory newCtx) {
+        (ISuperfluid host, IConstantFlowAgreementV1 cfa) = _getAndCacheHostAndCFA(token);
+        (newCtx, ) = host.callAgreementWithContext(
+            cfa,
+            abi.encodeCall(
+                cfa.revokeFlowOperatorWithFullControl,
+                (token, flowOperator, new bytes(0))
+            ),
+            "0x",
+            ctx
+        );
+    }
+
     /** CFA VIEW FUNCTIONS ************************************* */
 
     /**
-     * @dev get flow rate between two accounts for given token
+     * @dev get CFA flow rate between two accounts for given token
      * @param token The token used in flow
      * @param sender The sender of the flow
      * @param receiver The receiver of the flow
      * @return flowRate The flow rate
      */
-    function getFlowRate(ISuperToken token, address sender, address receiver)
+    function getCFAFlowRate(ISuperToken token, address sender, address receiver)
         internal view returns(int96 flowRate)
     {
         (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
@@ -816,7 +1104,7 @@ library SuperTokenV1Library {
     }
 
     /**
-     * @dev get flow info between two accounts for given token
+     * @dev get CFA flow info between two accounts for given token
      * @param token The token used in flow
      * @param sender The sender of the flow
      * @param receiver The receiver of the flow
@@ -825,49 +1113,12 @@ library SuperTokenV1Library {
      * @return deposit The amount of deposit the flow
      * @return owedDeposit The amount of owed deposit of the flow
      */
-    function getFlowInfo(ISuperToken token, address sender, address receiver)
+    function getCFAFlowInfo(ISuperToken token, address sender, address receiver)
         internal view
         returns(uint256 lastUpdated, int96 flowRate, uint256 deposit, uint256 owedDeposit)
     {
         (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
         (lastUpdated, flowRate, deposit, owedDeposit) = cfa.getFlow(token, sender, receiver);
-    }
-
-    /**
-     * @dev get flow info of a distributor to a pool for given token
-     * @param token The token used in flow
-     * @param distributor The sitributor of the flow
-     * @param pool The GDA pool
-     * @return lastUpdated Timestamp of flow creation or last flowrate change
-     * @return flowRate The flow rate
-     * @return deposit The amount of deposit the flow
-     */
-    function getGDAFlowInfo(ISuperToken token, address distributor, ISuperfluidPool pool)
-        internal view
-        returns(uint256 lastUpdated, int96 flowRate, uint256 deposit)
-    {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.getFlow(token, distributor, pool);
-    }
-
-    /* function getGDAFlowInfo(ISuperToken token, address distributor, ISuperfluidPool pool) */
-    /* { */
-    /* } */
-
-    /**
-     * @dev get net flow rate for given account for given token (CFA + GDA)
-     * @param token Super token address
-     * @param account Account to query
-     * @return flowRate The net flow rate of the account
-     */
-    function getNetFlowRate(ISuperToken token, address account)
-        internal view returns (int96 flowRate)
-    {
-        (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        int96 cfaNetFlow = cfa.getNetFlow(token, account);
-        int96 gdaNetFlow = gda.getNetFlow(token, account);
-        return cfaNetFlow + gdaNetFlow;
     }
 
     /**
@@ -881,57 +1132,6 @@ library SuperTokenV1Library {
     {
         (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
         return cfa.getNetFlow(token, account);
-    }
-
-    /**
-     * @dev get GDA net flow rate for given account for given token
-     * @param token Super token address
-     * @param account Account to query
-     * @return flowRate The net flow rate of the account
-     */
-    function getGDANetFlowRate(ISuperToken token, address account)
-        internal view returns (int96 flowRate)
-    {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.getNetFlow(token, account);
-    }
-
-    /**
-     * @dev get the aggregated flow info of the account (CFA + GDA)
-     * @param token Super token address
-     * @param account Account to query
-     * @return lastUpdated Timestamp of the last change of the net flow
-     * @return flowRate The net flow rate of token for account
-     * @return deposit The sum of all deposits for account's flows
-     * @return owedDeposit The sum of all owed deposits for account's flows
-     */
-    function getNetFlowInfo(ISuperToken token, address account)
-        internal
-        view
-        returns (uint256 lastUpdated, int96 flowRate, uint256 deposit, uint256 owedDeposit)
-    {
-        (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-
-        {
-            (uint256 lastUpdatedCFA, int96 cfaNetFlowRate, uint256 cfaDeposit, uint256 cfaOwedDeposit) =
-                cfa.getAccountFlowInfo(token, account);
-
-            lastUpdated = lastUpdatedCFA;
-            flowRate += cfaNetFlowRate;
-            deposit += cfaDeposit;
-            owedDeposit += cfaOwedDeposit;
-        }
-
-        {
-            (uint256 lastUpdatedGDA, int96 gdaNetFlowRate, uint256 gdaDeposit) = gda.getAccountFlowInfo(token, account);
-
-            if (lastUpdatedGDA > lastUpdated) {
-                lastUpdated = lastUpdatedGDA;
-            }
-            flowRate += gdaNetFlowRate;
-            deposit += gdaDeposit;
-        }
     }
 
     /**
@@ -953,70 +1153,7 @@ library SuperTokenV1Library {
     }
 
     /**
-     * @dev get the aggregated GDA flow info of the account
-     * @param token Super token address
-     * @param account Account to query
-     * @return lastUpdated Timestamp of the last change of the net flow
-     * @return flowRate The net flow rate of token for account
-     * @return deposit The sum of all deposits for account's flows
-     * @return owedDeposit The sum of all owed deposits for account's flows
-     */
-    function getGDANetFlowInfo(ISuperToken token, address account)
-        internal
-        view
-        returns (uint256 lastUpdated, int96 flowRate, uint256 deposit, uint256 owedDeposit)
-    {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        (lastUpdated, flowRate, deposit) = gda.getAccountFlowInfo(token, account);
-        owedDeposit = 0; // unused in GDA
-    }
-
-    /**
-     * @dev get the adjustment flow rate for a pool
-     * @param token Super token address
-     * @param pool The pool to query
-     * @return poolAdjustmentFlowRate The adjustment flow rate of the pool
-     */
-    function getPoolAdjustmentFlowRate(ISuperToken token, ISuperfluidPool pool)
-        internal
-        view
-        returns (int96 poolAdjustmentFlowRate)
-    {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.getPoolAdjustmentFlowRate(address(pool));
-    }
-
-    /**
-     * @dev Get the total amount of tokens received by a member via instant and flowing distributions
-     * @param pool The pool to query
-     * @param memberAddr The member to query
-     * @return totalAmountReceived The total amount received by the member
-     */
-    function getTotalAmountReceivedByMember(ISuperfluidPool pool, address memberAddr)
-        internal
-        view
-        returns (uint256 totalAmountReceived)
-    {
-        return pool.getTotalAmountReceivedByMember(memberAddr);
-    }
-
-    /**
-     * @notice calculate buffer for a CFA/GDA flow rate
-     * @dev Even though we are using the CFA, the logic for calculating buffer is the same in the GDA
-     *      and a change in the buffer logic in either means it is a BREAKING change
-     * @param token The token used in flow
-     * @param flowRate The flowrate to calculate the needed buffer for
-     * @return bufferAmount The buffer amount based on flowRate, liquidationPeriod and minimum deposit
-     */
-    function getBufferAmountByFlowRate(ISuperToken token, int96 flowRate) internal view
-        returns (uint256 bufferAmount)
-    {
-        (, IConstantFlowAgreementV1 cfa) = _getHostAndCFA(token);
-        return cfa.getDepositRequiredForFlowRate(token, flowRate);
-    }
-
-    /**
-     * @dev get existing flow permissions
+     * @dev get existing CFA flow permissions
      * @param token The token used in flow
      * @param sender sender of a flow
      * @param flowOperator the address we are checking permissions of for sender & token
@@ -1037,804 +1174,7 @@ library SuperTokenV1Library {
         allowDelete = permissionsBitmask >> 2 & 1 == 1;
     }
 
-
-     /** IDA VIEW FUNCTIONS ************************************* */
-
-
-    /**
-     * @dev Gets an index by its ID and publisher.
-     * @param token Super token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @return exist True if the index exists.
-     * @return indexValue Total value of the index.
-     * @return totalUnitsApproved Units of the index approved by subscribers.
-     * @return totalUnitsPending Units of teh index not yet approved by subscribers.
-     */
-    function getIndex(ISuperToken token, address publisher, uint32 indexId)
-        internal view
-        returns (bool exist, uint128 indexValue, uint128 totalUnitsApproved, uint128 totalUnitsPending)
-    {
-        (, IInstantDistributionAgreementV1 ida) = _getHostAndIDA(token);
-        return ida.getIndex(token, publisher, indexId);
-    }
-
-    /**
-     * @dev Calculates the distribution amount based on the amount of tokens desired to distribute.
-     * @param token Super token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param amount Amount of tokens desired to distribute.
-     * @return actualAmount Amount to be distributed with correct rounding.
-     * @return newIndexValue The index value after the distribution would be called.
-     */
-    function calculateDistribution(ISuperToken token, address publisher, uint32 indexId, uint256 amount)
-        internal view
-        returns (uint256 actualAmount, uint128 newIndexValue)
-    {
-        (, IInstantDistributionAgreementV1 ida) = _getHostAndIDA(token);
-        return ida.calculateDistribution(token, publisher, indexId, amount);
-    }
-
-    /**
-     * @dev List all subscriptions of an address
-     * @param token Super token used in the indexes listed.
-     * @param subscriber Subscriber address.
-     * @return publishers Publishers of the indices.
-     * @return indexIds IDs of the indices.
-     * @return unitsList Units owned of the indices.
-     */
-    function listSubscriptions(
-        ISuperToken token,
-        address subscriber
-    )
-        internal view
-        returns (
-            address[] memory publishers,
-            uint32[] memory indexIds,
-            uint128[] memory unitsList
-        )
-    {
-        (, IInstantDistributionAgreementV1 ida) = _getHostAndIDA(token);
-        return ida.listSubscriptions(token, subscriber);
-    }
-
-    /**
-     * @dev Gets subscription by publisher, index id, and subscriber.
-     * @param token Super token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber to the index.
-     * @return exist True if the subscription exists.
-     * @return approved True if the subscription has been approved by the subscriber.
-     * @return units Units held by the subscriber
-     * @return pendingDistribution If not approved, the amount to be claimed on approval.
-     */
-    function getSubscription(ISuperToken token, address publisher, uint32 indexId, address subscriber)
-        internal view
-        returns (bool exist, bool approved, uint128 units, uint256 pendingDistribution)
-    {
-        (, IInstantDistributionAgreementV1 ida) = _getHostAndIDA(token);
-        return ida.getSubscription(token, publisher, indexId, subscriber);
-    }
-
-    /*
-     * @dev Gets subscription by the agreement ID.
-     * @param token Super Token used with the index.
-     * @param agreementId Agreement ID, unique to the subscriber and index ID.
-     * @return publisher Publisher of the index.
-     * @return indexId ID of the index.
-     * @return approved True if the subscription has been approved by the subscriber.
-     * @return units Units held by the subscriber
-     * @return pendingDistribution If not approved, the amount to be claimed on approval.
-     */
-    function getSubscriptionByID(ISuperToken token, bytes32 agreementId)
-        internal view
-        returns (
-            address publisher,
-            uint32 indexId,
-            bool approved,
-            uint128 units,
-            uint256 pendingDistribution
-        )
-    {
-        (, IInstantDistributionAgreementV1 ida) = _getHostAndIDA(token);
-        return ida.getSubscriptionByID(token, agreementId);
-    }
-
-    /** GDA VIEW FUNCTIONS ************************************* */
-    function getFlowDistributionFlowRate(ISuperToken token, address from, ISuperfluidPool to)
-        internal
-        view
-        returns (int96)
-    {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.getFlowRate(token, from, to);
-    }
-
-    function estimateFlowDistributionActualFlowRate(
-        ISuperToken token,
-        address from,
-        ISuperfluidPool to,
-        int96 requestedFlowRate
-    ) internal view returns (int96 actualFlowRate, int96 totalDistributionFlowRate) {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.estimateFlowDistributionActualFlowRate(token, from, to, requestedFlowRate);
-    }
-
-    function estimateDistributionActualAmount(
-        ISuperToken token,
-        address from,
-        ISuperfluidPool to,
-        uint256 requestedAmount
-    ) internal view returns (uint256 actualAmount) {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.estimateDistributionActualAmount(token, from, to, requestedAmount);
-    }
-
-    function isMemberConnected(ISuperToken token, address pool, address member) internal view returns (bool) {
-        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
-        return gda.isMemberConnected(ISuperfluidPool(pool), member);
-    }
-
-
-    /** IDA BASE FUNCTIONS ************************************* */
-
-
-    /**
-     * @dev Creates a new index.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     */
-    function createIndex(
-        ISuperToken token,
-        uint32 indexId
-    ) internal returns (bool) {
-        return createIndex(token, indexId, new bytes(0));
-    }
-
-    /**
-     * @dev Creates a new index with userData.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param userData Arbitrary user data field.
-     */
-    function createIndex(
-        ISuperToken token,
-        uint32 indexId,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.createIndex,
-                (
-                    token,
-                    indexId,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Updates an index value. This distributes an amount of tokens equal to
-     * `indexValue - lastIndexValue`. See `distribute` for another way to distribute.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param indexValue New TOTAL index value, this will equal the total amount distributed.
-     */
-    function updateIndexValue(
-        ISuperToken token,
-        uint32 indexId,
-        uint128 indexValue
-    ) internal returns (bool) {
-        return updateIndexValue(token, indexId, indexValue, new bytes(0));
-    }
-
-    /**
-     * @dev Updates an index value with userData. This distributes an amount of tokens equal to
-     * `indexValue - lastIndexValue`. See `distribute` for another way to distribute.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param indexValue New TOTAL index value, this will equal the total amount distributed.
-     * @param userData Arbitrary user data field.
-     */
-    function updateIndexValue(
-        ISuperToken token,
-        uint32 indexId,
-        uint128 indexValue,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.updateIndex,
-                (
-                    token,
-                    indexId,
-                    indexValue,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Distributes tokens in a more developer friendly way than `updateIndex`. Instead of
-     * passing the new total index value, you pass the amount of tokens desired to be distributed.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param amount - total number of tokens desired to be distributed
-     * NOTE in many cases, there can be some precision loss
-     This may cause a slight difference in the amount param specified and the actual amount distributed.
-     See below for math:
-     //indexDelta = amount the index will be updated by during an internal call to _updateIndex().
-     It is calculated like so:
-     indexDelta = amount / totalUnits
-     (see the distribute() implementatation in ./agreements/InstantDistributionAgreement.sol)
-     * NOTE Solidity does not support floating point numbers
-     So the indexDelta will be rounded down to the nearest integer.
-     This will create a 'remainder' amount of tokens that will not be distributed
-     (we'll call this the 'distribution modulo')
-     distributionModulo = amount - indexDelta * totalUnits
-     * NOTE due to rounding, there may be a small amount of tokens left in the publisher's account
-     This amount is equal to the 'distributionModulo' value
-     //
-     */
-    function distribute(
-        ISuperToken token,
-        uint32 indexId,
-        uint256 amount
-    ) internal returns (bool) {
-        return distribute(token, indexId, amount, new bytes(0));
-    }
-
-    /**
-     * @dev Distributes tokens in a more developer friendly way than `updateIndex` (w user data). Instead of
-     * passing the new total index value, this function will increase the index value by `amount`.
-     * This takes arbitrary user data.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param amount Amount by which the index value should increase.
-     * @param userData Arbitrary user data field.
-     */
-    function distribute(
-        ISuperToken token,
-        uint32 indexId,
-        uint256 amount,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.distribute,
-                (
-                    token,
-                    indexId,
-                    amount,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Approves a subscription to an index. The subscriber's real time balance will not update
-     * until the subscription is approved, but once approved, the balance will be updated with
-     * prior distributions.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     */
-    function approveSubscription(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId
-    ) internal returns (bool) {
-        return approveSubscription(token, publisher, indexId, new bytes(0));
-    }
-
-    /**
-     * @dev Approves a subscription to an index with user data. The subscriber's real time balance will not update
-     * until the subscription is approved, but once approved, the balance will be updated with
-     * prior distributions.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param userData Arbitrary user data field.
-     */
-    function approveSubscription(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.approveSubscription,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Revokes a previously approved subscription.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     */
-    function revokeSubscription(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId
-    ) internal returns (bool) {
-        return revokeSubscription(token, publisher, indexId, new bytes(0));
-    }
-
-    /**
-     * @dev Revokes a previously approved subscription. This takes arbitrary user data.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param userData Arbitrary user data field.
-     */
-    function revokeSubscription(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.revokeSubscription,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Updates the units of a subscription. This changes the number of shares the subscriber holds
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address whose units are to be updated.
-     * @param units New number of units the subscriber holds.
-     */
-    function updateSubscriptionUnits(
-        ISuperToken token,
-        uint32 indexId,
-        address subscriber,
-        uint128 units
-    ) internal returns (bool) {
-        return updateSubscriptionUnits(token, indexId, subscriber, units, new bytes(0));
-    }
-
-    /**
-     * @dev Updates the units of a subscription. This changes the number of shares the subscriber
-     * holds. This takes arbitrary user data.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address whose units are to be updated.
-     * @param units New number of units the subscriber holds.
-     * @param userData Arbitrary user data field.
-     */
-    function updateSubscriptionUnits(
-        ISuperToken token,
-        uint32 indexId,
-        address subscriber,
-        uint128 units,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-         ida,
-            abi.encodeCall(
-                ida.updateSubscription,
-                (
-                    token,
-                    indexId,
-                    subscriber,
-                    units,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Deletes a subscription, setting a subcriber's units to zero
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address whose units are to be deleted.
-     */
-    function deleteSubscription(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        address subscriber
-    ) internal returns (bool) {
-        return deleteSubscription(token, publisher, indexId, subscriber, new bytes(0));
-    }
-
-    /**
-     * @dev Deletes a subscription, setting a subcriber's units to zero. This takes arbitrary userdata.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address whose units are to be deleted.
-     * @param userData Arbitrary user data field.
-     */
-    function deleteSubscription(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        address subscriber,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.deleteSubscription,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    subscriber,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /**
-     * @dev Claims pending distribution. Subscription should not be approved
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address that receives the claim.
-     */
-    function claim(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        address subscriber
-    ) internal returns (bool) {
-        return claim(token, publisher, indexId, subscriber, new bytes(0));
-    }
-
-    /**
-     * @dev Claims pending distribution. Subscription should not be approved. This takes arbitrary user data.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address that receives the claim.
-     * @param userData Arbitrary user data field.
-     */
-    function claim(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        address subscriber,
-        bytes memory userData
-    ) internal returns (bool) {
-         (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        host.callAgreement(
-            ida,
-            abi.encodeCall(
-                ida.claim,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    subscriber,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            userData
-        );
-        return true;
-    }
-
-    /** IDA WITH CTX FUNCTIONS ************************************* */
-
-    /**
-     * @dev Creates a new index with ctx.
-     * Meant for usage in super app callbacks
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function createIndexWithCtx(
-        ISuperToken token,
-        uint32 indexId,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.createIndex,
-                (
-                    token,
-                    indexId,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Updates an index value with ctx. This distributes an amount of tokens equal to
-     * `indexValue - lastIndexValue`. See `distribute` for another way to distribute.
-     * Meant for usage in super app callbakcs
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param indexValue New TOTAL index value, this will equal the total amount distributed.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function updateIndexValueWithCtx(
-        ISuperToken token,
-        uint32 indexId,
-        uint128 indexValue,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.updateIndex,
-                (
-                    token,
-                    indexId,
-                    indexValue,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Distributes tokens in a more developer friendly way than `updateIndex`.Instead of
-     * passing the new total index value, this function will increase the index value by `amount`.
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param amount Amount by which the index value should increase.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function distributeWithCtx(
-        ISuperToken token,
-        uint32 indexId,
-        uint256 amount,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.distribute,
-                (
-                    token,
-                    indexId,
-                    amount,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Approves a subscription to an index. The subscriber's real time balance will not update
-     * until the subscription is approved, but once approved, the balance will be updated with
-     * prior distributions.
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function approveSubscriptionWithCtx(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.approveSubscription,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Revokes a previously approved subscription. Meant for usage in super apps
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function revokeSubscriptionWithCtx(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.revokeSubscription,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Updates the units of a subscription. This changes the number of shares the subscriber
-     * holds. Meant for usage in super apps
-     * @param token Super Token used with the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address whose units are to be updated.
-     * @param units New number of units the subscriber holds.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function updateSubscriptionUnitsWithCtx(
-        ISuperToken token,
-        uint32 indexId,
-        address subscriber,
-        uint128 units,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-         ida,
-            abi.encodeCall(
-                ida.updateSubscription,
-                (
-                    token,
-                    indexId,
-                    subscriber,
-                    units,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Deletes a subscription, setting a subcriber's units to zero.
-     * Meant for usage in super apps
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address whose units are to be deleted.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function deleteSubscriptionWithCtx(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        address subscriber,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.deleteSubscription,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    subscriber,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
-    /**
-     * @dev Claims pending distribution. Subscription should not be approved.
-     * Meant for usage in super app callbacks
-     * @param token Super Token used with the index.
-     * @param publisher Publisher of the index.
-     * @param indexId ID of the index.
-     * @param subscriber Subscriber address that receives the claim.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function claimWithCtx(
-        ISuperToken token,
-        address publisher,
-        uint32 indexId,
-        address subscriber,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-         (ISuperfluid host, IInstantDistributionAgreementV1 ida) = _getAndCacheHostAndIDA(token);
-        (newCtx, ) = host.callAgreementWithContext(
-            ida,
-            abi.encodeCall(
-                ida.claim,
-                (
-                    token,
-                    publisher,
-                    indexId,
-                    subscriber,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
-
     /** GDA BASE FUNCTIONS ************************************* */
-
 
     /**
      * @dev Creates a new Superfluid Pool.
@@ -1852,42 +1192,33 @@ library SuperTokenV1Library {
     }
 
     /**
-     * @dev Updates the units of a pool member.
+     * @dev Creates a new Superfluid Pool with default PoolConfig: units not transferrable, allow multi-distributors
      * @param token The Super Token address.
-     * @param pool The Superfluid Pool to update.
-     * @param memberAddress The address of the member to update.
-     * @param newUnits The new units of the member.
-     * @return bool A boolean value indicating whether the pool was created successfully.
+     * @param admin The pool admin address.
+     * @return pool The address of the deployed Superfluid Pool
      */
-    function updateMemberUnits(ISuperToken token, ISuperfluidPool pool, address memberAddress, uint128 newUnits)
+    function createPool(ISuperToken token, address admin)
         internal
-        returns (bool)
+        returns (ISuperfluidPool pool)
     {
-        return updateMemberUnits(token, pool, memberAddress, newUnits, new bytes(0));
+        return createPool(
+            token,
+            admin,
+            PoolConfig({
+                transferabilityForUnitsOwner: false,
+                distributionFromAnyAddress: true
+            })
+        );
     }
 
     /**
-     * @dev Updates the units of a pool member.
-     * @param token The Super Token address.
-     * @param pool The Superfluid Pool to update.
-     * @param memberAddress The address of the member to update.
-     * @param newUnits The new units of the member.
-     * @param userData User-specific data.
-     * @return A boolean value indicating whether the pool was created successfully.
+     * @dev Creates a new Superfluid Pool with default PoolConfig and the caller set as admin
+     * @return pool The address of the deployed Superfluid Pool
      */
-    function updateMemberUnits(
-        ISuperToken token,
-        ISuperfluidPool pool,
-        address memberAddress,
-        uint128 newUnits,
-        bytes memory userData
-    ) internal returns (bool) {
-        (ISuperfluid host, IGeneralDistributionAgreementV1 gda) = _getAndCacheHostAndGDA(token);
-        host.callAgreement(
-            gda, abi.encodeCall(gda.updateMemberUnits, (pool, memberAddress, newUnits, new bytes(0))), userData
-        );
-
-        return true;
+    function createPool(ISuperToken token) internal returns (ISuperfluidPool pool) {
+        // note: from the perspective of the lib, msg.sender is the contract using the lib.
+        // from the perspective of the GDA contract, that will be the msg.sender
+        return createPool(token, address(this));
     }
 
     /**
@@ -1970,12 +1301,28 @@ library SuperTokenV1Library {
     /**
      * @dev Tries to distribute `requestedAmount` amount of `token` from `from` to `pool`.
      * @param token The Super Token address.
+     * @param pool The Superfluid Pool address.
+     * @param requestedAmount The amount of tokens to distribute.
+     * @return A boolean value indicating whether the distribution was successful.
+     */
+    function distribute(ISuperToken token, ISuperfluidPool pool, uint256 requestedAmount)
+        internal
+        returns (bool)
+    {
+        return distribute(token, address(this), pool, requestedAmount, new bytes(0));
+    }
+
+    /**
+     * @dev Tries to distribute `requestedAmount` amount of `token` from `from` to `pool`.
+     * NOTE: has an additional argument `from`, but can only be msg.sender because GDA
+     * currently doesn't have ACL support. Only included for API completeness.
+     * @param token The Super Token address.
      * @param from The address from which to distribute tokens.
      * @param pool The Superfluid Pool address.
      * @param requestedAmount The amount of tokens to distribute.
      * @return A boolean value indicating whether the distribution was successful.
      */
-    function distributeToPool(ISuperToken token, address from, ISuperfluidPool pool, uint256 requestedAmount)
+    function distribute(ISuperToken token, address from, ISuperfluidPool pool, uint256 requestedAmount)
         internal
         returns (bool)
     {
@@ -2007,6 +1354,22 @@ library SuperTokenV1Library {
 
     /**
      * @dev Tries to distribute flow at `requestedFlowRate` of `token` from `from` to `pool`.
+     * @param token The Super Token address.
+     * @param pool The Superfluid Pool address.
+     * @param requestedFlowRate The flow rate of tokens to distribute.
+     * @return A boolean value indicating whether the distribution was successful.
+     */
+    function distributeFlow(ISuperToken token, ISuperfluidPool pool, int96 requestedFlowRate)
+        internal
+        returns (bool)
+    {
+        return distributeFlow(token, address(this), pool, requestedFlowRate, new bytes(0));
+    }
+
+    /**
+     * @dev Tries to distribute flow at `requestedFlowRate` of `token` from `from` to `pool`.
+     * NOTE: The ability to set the `from` argument is needed only when liquidating a GDA flow.
+     * The GDA currently doesn't have ACL support.
      * @param token The Super Token address.
      * @param from The address from which to distribute tokens.
      * @param pool The Superfluid Pool address.
@@ -2044,39 +1407,6 @@ library SuperTokenV1Library {
     }
 
     /** GDA WITH CTX FUNCTIONS ************************************* */
-
-    /**
-     * @dev Updates the units of a pool member.
-     * @param token The Super Token address.
-     * @param pool The Superfluid Pool to update.
-     * @param memberAddress The address of the member to update.
-     * @param newUnits The new units of the member.
-     * @param ctx Context bytes (see ISuperfluid.sol for Context struct)
-     * @return newCtx The updated context after the execution of the agreement function
-     */
-    function updateMemberUnitsWithCtx(
-        ISuperToken token,
-        ISuperfluidPool pool,
-        address memberAddress,
-        uint128 newUnits,
-        bytes memory ctx
-    ) internal returns (bytes memory newCtx) {
-        (ISuperfluid host, IGeneralDistributionAgreementV1 gda) = _getAndCacheHostAndGDA(token);
-        (newCtx,) = host.callAgreementWithContext(
-            gda,
-            abi.encodeCall(
-                gda.updateMemberUnits,
-                (
-                    pool,
-                    memberAddress,
-                    newUnits,
-                    new bytes(0) // ctx placeholder
-                )
-            ),
-            "0x",
-            ctx
-        );
-    }
 
     /**
      * @dev Claims all tokens from the pool.
@@ -2226,7 +1556,147 @@ library SuperTokenV1Library {
         );
     }
 
-    // ************** private helpers **************
+    /** GDA VIEW FUNCTIONS ************************************* */
+
+    /**
+     * @dev get flowrate between a distributor and pool for given token
+     * @param token The token used in flow
+     * @param distributor The ditributor of the flow
+     * @param pool The GDA pool
+     * @return flowRate The flow rate
+     */
+    function getGDAFlowRate(ISuperToken token, address distributor, ISuperfluidPool pool)
+        internal view returns(int96 flowRate)
+    {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.getFlowRate(token, distributor, pool);
+    }
+
+    /// alias of getGDAFlowRate
+    function getFlowDistributionFlowRate(ISuperToken token, address from, ISuperfluidPool to)
+        internal
+        view
+        returns (int96)
+    {
+        return getGDAFlowRate(token, from, to);
+    }
+
+    /**
+     * @dev get flow info of a distributor to a pool for given token
+     * @param token The token used in flow
+     * @param distributor The ditributor of the flow
+     * @param pool The GDA pool
+     * @return lastUpdated Timestamp of flow creation or last flowrate change
+     * @return flowRate The flow rate
+     * @return deposit The amount of deposit the flow
+     */
+    function getGDAFlowInfo(ISuperToken token, address distributor, ISuperfluidPool pool)
+        internal view
+        returns(uint256 lastUpdated, int96 flowRate, uint256 deposit)
+    {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.getFlow(token, distributor, pool);
+    }
+
+    /**
+     * @dev get GDA net flow rate for given account for given token
+     * @param token Super token address
+     * @param account Account to query
+     * @return flowRate The net flow rate of the account
+     */
+    function getGDANetFlowRate(ISuperToken token, address account)
+        internal view returns (int96 flowRate)
+    {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.getNetFlow(token, account);
+    }
+
+    /**
+     * @dev get the aggregated GDA flow info of the account
+     * @param token Super token address
+     * @param account Account to query
+     * @return lastUpdated Timestamp of the last change of the net flow
+     * @return flowRate The net flow rate of token for account
+     * @return deposit The sum of all deposits for account's flows
+     * @return owedDeposit The sum of all owed deposits for account's flows
+     */
+    function getGDANetFlowInfo(ISuperToken token, address account)
+        internal
+        view
+        returns (uint256 lastUpdated, int96 flowRate, uint256 deposit, uint256 owedDeposit)
+    {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        (lastUpdated, flowRate, deposit) = gda.getAccountFlowInfo(token, account);
+        owedDeposit = 0; // unused in GDA
+    }
+
+    /**
+     * @dev get the adjustment flow rate for a pool
+     * @param token Super token address
+     * @param pool The pool to query
+     * @return poolAdjustmentFlowRate The adjustment flow rate of the pool
+     */
+    function getPoolAdjustmentFlowRate(ISuperToken token, ISuperfluidPool pool)
+        internal
+        view
+        returns (int96 poolAdjustmentFlowRate)
+    {
+        if (token != pool.superToken()) revert("pool/token mismatch");
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.getPoolAdjustmentFlowRate(address(pool));
+    }
+
+    /**
+     * @dev Get the total amount of tokens received by a member via instant and flowing distributions
+     * @param token Super token address
+     * @param pool The pool to query
+     * @param memberAddr The member to query
+     * @return totalAmountReceived The total amount received by the member
+     */
+    function getTotalAmountReceivedByMember(ISuperToken token, ISuperfluidPool pool, address memberAddr)
+        internal
+        view
+        returns (uint256 totalAmountReceived)
+    {
+        if (token != pool.superToken()) revert("pool/token mismatch");
+        return pool.getTotalAmountReceivedByMember(memberAddr);
+    }
+
+    /// alias for `getTotalAmountReceivedByMember`
+    function getTotalAmountReceivedFromPool(ISuperToken token, ISuperfluidPool pool, address memberAddr)
+        internal
+        view
+        returns (uint256 totalAmountReceived)
+    {
+        return getTotalAmountReceivedByMember(token, pool, memberAddr);
+    }
+
+    function estimateFlowDistributionActualFlowRate(
+        ISuperToken token,
+        address from,
+        ISuperfluidPool to,
+        int96 requestedFlowRate
+    ) internal view returns (int96 actualFlowRate, int96 totalDistributionFlowRate) {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.estimateFlowDistributionActualFlowRate(token, from, to, requestedFlowRate);
+    }
+
+    function estimateDistributionActualAmount(
+        ISuperToken token,
+        address from,
+        ISuperfluidPool to,
+        uint256 requestedAmount
+    ) internal view returns (uint256 actualAmount) {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.estimateDistributionActualAmount(token, from, to, requestedAmount);
+    }
+
+    function isMemberConnected(ISuperToken token, address pool, address member) internal view returns (bool) {
+        (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+        return gda.isMemberConnected(ISuperfluidPool(pool), member);
+    }
+
+    /** PRIVATE HELPERS ************************************* */
 
     // @note We must use hardcoded constants here because:
     // Only direct number constants and references to such constants are supported by inline assembly.
@@ -2234,8 +1704,6 @@ library SuperTokenV1Library {
     bytes32 private constant _HOST_SLOT = 0x65599bf746e17a00ea62e3610586992d88101b78eec3cf380706621fb97ea837;
     // keccak256("org.superfluid-finance.apps.SuperTokenLibrary.v1.cfa")
     bytes32 private constant _CFA_SLOT = 0xb969d79d88acd02d04ed7ee7d43b949e7daf093d363abcfbbc43dfdfd1ce969a;
-    // keccak256("org.superfluid-finance.apps.SuperTokenLibrary.v1.ida");
-    bytes32 private constant _IDA_SLOT = 0xa832ee1924ea960211af2df07d65d166232018f613ac6708043cd8f8773eddeb;
     // keccak256("org.superfluid-finance.apps.SuperTokenLibrary.v1.gda");
     bytes32 private constant _GDA_SLOT = 0xc36f6c05164a669ecb6da53e218d77ae44d51cfc99f91e5a125a18de0949bee4;
 
@@ -2268,36 +1736,6 @@ library SuperTokenV1Library {
         }
         assert(address(host) != address(0));
         assert(address(cfa) != address(0));
-    }
-
-    // gets the host and ida addrs for the token and caches it in storage for gas efficiency
-    // to be used in state changing methods
-    function _getAndCacheHostAndIDA(ISuperToken token)
-        private
-        returns (ISuperfluid host, IInstantDistributionAgreementV1 ida)
-    {
-        // check if already in contract storage...
-        assembly {
-            // solium-disable-line
-            host := sload(_HOST_SLOT)
-            ida := sload(_IDA_SLOT)
-        }
-        if (address(ida) == address(0)) {
-            // framework contract addrs not yet cached, retrieving now...
-            if (address(host) == address(0)) {
-                host = ISuperfluid(token.getHost());
-            }
-            ida = IInstantDistributionAgreementV1(address(ISuperfluid(host).getAgreementClass(
-                keccak256("org.superfluid-finance.agreements.InstantDistributionAgreement.v1"))));
-            // now that we got them and are in a transaction context, persist in storage
-            assembly {
-                // solium-disable-line
-                sstore(_HOST_SLOT, host)
-                sstore(_IDA_SLOT, ida)
-            }
-        }
-        assert(address(host) != address(0));
-        assert(address(ida) != address(0));
     }
 
     // gets the host and gda addrs for the token and caches it in storage for gas efficiency
@@ -2356,31 +1794,6 @@ library SuperTokenV1Library {
         assert(address(cfa) != address(0));
     }
 
-    // gets the host and ida addrs for the token
-    // to be used in non-state changing methods (view functions)
-    function _getHostAndIDA(ISuperToken token)
-        private
-        view
-        returns (ISuperfluid host, IInstantDistributionAgreementV1 ida)
-    {
-        // check if already in contract storage...
-        assembly {
-            // solium-disable-line
-            host := sload(_HOST_SLOT)
-            ida := sload(_IDA_SLOT)
-        }
-        if (address(ida) == address(0)) {
-            // framework contract addrs not yet cached in storage, retrieving now...
-            if (address(host) == address(0)) {
-                host = ISuperfluid(token.getHost());
-            }
-            ida = IInstantDistributionAgreementV1(address(ISuperfluid(host).getAgreementClass(
-                keccak256("org.superfluid-finance.agreements.InstantDistributionAgreement.v1"))));
-        }
-        assert(address(host) != address(0));
-        assert(address(ida) != address(0));
-    }
-
     // gets the host and gda addrs for the token
     // to be used in non-state changing methods (view functions)
     function _getHostAndGDA(ISuperToken token)
@@ -2409,5 +1822,16 @@ library SuperTokenV1Library {
         }
         assert(address(host) != address(0));
         assert(address(gda) != address(0));
+    }
+
+    function _isPool(ISuperToken token, address maybePool)
+        private view returns (bool) {
+        // first check if it's a contract (saves some gas if not)
+        if (maybePool.code.length > 0) {
+            // it's a contract, now check if it's a pool
+            (, IGeneralDistributionAgreementV1 gda) = _getHostAndGDA(token);
+            return (gda.isPool(token, maybePool));
+        }
+        return false;
     }
 }

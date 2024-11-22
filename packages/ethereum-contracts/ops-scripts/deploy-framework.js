@@ -207,7 +207,6 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
     const contracts = [
         "Ownable",
         "CFAv1Forwarder",
-        "IDAv1Forwarder",
         "GDAv1Forwarder",
         "IMultiSigWallet",
         "ISafe",
@@ -245,7 +244,6 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
         IMultiSigWallet,
         ISafe,
         CFAv1Forwarder,
-        IDAv1Forwarder,
         GDAv1Forwarder,
         SuperfluidGovernanceBase,
         Resolver,
@@ -753,23 +751,6 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
                 await web3tx(
                     governance.enableTrustedForwarder,
                     `Governance set CFAv1Forwarder`
-                )(superfluid.address, ZERO_ADDRESS, forwarder.address);
-                return forwarder;
-            }
-        );
-
-        // deploy IDAv1Forwarder for test deployments
-        // for other (permanent) deployments, it's not handled by this script
-        await deployAndRegisterContractIf(
-            IDAv1Forwarder,
-            "IDAv1Forwarder",
-            async (contractAddress) => contractAddress === ZERO_ADDRESS,
-            async () => {
-                const forwarder = await IDAv1Forwarder.new(superfluid.address);
-                output += `IDA_V1_FORWARDER=${forwarder.address}\n`;
-                await web3tx(
-                    governance.enableTrustedForwarder,
-                    `Governance set IDAv1Forwarder`
                 )(superfluid.address, ZERO_ADDRESS, forwarder.address);
                 return forwarder;
             }
